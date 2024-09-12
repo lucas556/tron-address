@@ -1,19 +1,3 @@
-/*
-    Copyright (C) 2023 MrSpike63
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as published by
-    the Free Software Foundation, version 3.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
-
 #pragma once
 #include "curve_math.h"
 #include "keccak.h"
@@ -56,7 +40,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) gpu_address_init(CurvePoint* block
 }
 
 
-__global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_address_work(int score_method, CurvePoint* offsets) {
+__global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_address_work(CurvePoint* offsets) {  // Removed score_method parameter
     bool b = __isGlobal(offsets);
     __builtin_assume(b);
 
@@ -65,9 +49,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_address_work(int score_meth
 
     CurvePoint p = offsets[thread_id];
 
-    handle_output(score_method, calculate_address(p.x, p.y), key, 0);
-    handle_output(score_method, calculate_address(p.x, sub_256(P, p.y)), key, 1);
-
+    handle_output(calculate_address(p.x, p.y), key, 0);  // Removed score_method
+    handle_output(calculate_address(p.x, sub_256(P, p.y)), key, 1);
 
     _uint256 z[THREAD_WORK - 1];
     z[0] = sub_256_mod_p(p.x, addends[0].x);
@@ -87,8 +70,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_address_work(int score_meth
         _uint256 curve_x = sub_256_mod_p(sub_256_mod_p(mul_256_mod_p(lambda, lambda), p.x), addends[i].x);
         _uint256 curve_y = sub_256_mod_p(mul_256_mod_p(lambda, sub_256_mod_p(p.x, curve_x)), p.y);
 
-        handle_output(score_method, calculate_address(curve_x, curve_y), key + i + 1, 0);
-        handle_output(score_method, calculate_address(curve_x, sub_256(P, curve_y)), key + i + 1, 1);
+        handle_output(calculate_address(curve_x, curve_y), key + i + 1, 0);
+        handle_output(calculate_address(curve_x, sub_256(P, curve_y)), key + i + 1, 1);
     }
 
     _uint256 y = q;
@@ -97,6 +80,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) gpu_address_work(int score_meth
     _uint256 curve_x = sub_256_mod_p(sub_256_mod_p(mul_256_mod_p(lambda, lambda), p.x), addends[0].x);
     _uint256 curve_y = sub_256_mod_p(mul_256_mod_p(lambda, sub_256_mod_p(p.x, curve_x)), p.y);
 
-    handle_output(score_method, calculate_address(curve_x, curve_y), key + 1, 0);
-    handle_output(score_method, calculate_address(curve_x, sub_256(P, curve_y)), key + 1, 1);
+    handle_output(calculate_address(curve_x, curve_y), key + 1, 0);
+    handle_output(calculate_address(curve_x, sub_256(P, curve_y)), key + 1, 1);
 }
