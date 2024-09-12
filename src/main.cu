@@ -28,10 +28,33 @@ __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
 
-__device__ void handle_output(int score_method, Address a, uint64_t key, bool inv) {
-    int score = 0;
-    if (score_method == 0) { score = score_leading_zeros(a); }
-    else if (score_method == 1) { score = score_zero_bytes(a); }
+__device__ int score_leading_zeros(Address a) {
+    int n = __clz(a.a);
+    if (n == 32) {
+        n += __clz(a.b);
+        if (n == 64) {
+            n += __clz(a.c);
+            if (n == 96) {
+                n += __clz(a.d);
+                if (n == 128) {
+                    n += __clz(a.e);
+                }
+            }
+        }
+    }
+    return n >> 3;
+}
+
+#ifdef __linux__
+    #define atomicMax_ul(a, b) atomicMax((unsigned long long*)(a), (unsigned long long)(b))
+    #define atomicAdd_ul(a, b) atomicAdd((unsigned long long*)(a), (unsigned long long)(b))
+#else
+    #define atomicMax_ul(a, b) atomicMax(a, b)
+    #define atomicAdd_ul(a, b) atomicAdd(a, b)
+#endif
+
+__device__ void handle_output(Address a, uint64_t key, bool inv) {
+    int score = score_leading_zeros(a);
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -46,8 +69,7 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
     }
 }
 
-
-#include "address.h"  // 放在 handle_output 函数定义之后
+#include "address.h"
 
 int global_max_score = 0;
 std::mutex global_max_score_mutex;
@@ -73,8 +95,6 @@ std::mutex message_queue_mutex;
         message_queue_mutex.lock(); \
         message_queue.push(Message{milliseconds(), 1, device_index, e}); \
         message_queue_mutex.unlock(); \
-        if (thread_offsets_host != 0) { cudaFreeHost(thread_offsets_host); } \
-        if (device_memory_host != 0) { cudaFreeHost(device_memory_host); } \
         cudaDeviceReset(); \
         return; \
     } \
@@ -84,7 +104,7 @@ uint64_t milliseconds() {
     return (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())).count();
 }
 
-void host_thread(int device, int device_index, int score_method) {
+void host_thread(int device, int device_index, Address origin_address) {
     uint64_t GRID_WORK = ((uint64_t)BLOCK_SIZE * (uint64_t)GRID_SIZE * (uint64_t)THREAD_WORK);
 
     CurvePoint* block_offsets = 0;
@@ -95,8 +115,6 @@ void host_thread(int device, int device_index, int score_method) {
     uint64_t* max_score_host;
     uint64_t* output_counter_host;
     uint64_t* output_buffer_host;
-    uint64_t* output_buffer2_host;
-    uint64_t* output_buffer3_host;
 
     gpu_assert(cudaSetDevice(device));
 
@@ -104,21 +122,21 @@ void host_thread(int device, int device_index, int score_method) {
     output_counter_host = device_memory_host;
     max_score_host = device_memory_host + 1;
     output_buffer_host = max_score_host + 1;
-    output_buffer2_host = output_buffer_host + OUTPUT_BUFFER_SIZE;
-    output_buffer3_host = output_buffer2_host + OUTPUT_BUFFER_SIZE;
 
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
     gpu_assert(cudaMemcpyToSymbol(device_memory, device_memory_host, 2 * sizeof(uint64_t)));
     gpu_assert(cudaDeviceSynchronize());
 
+    // 分配内存
     gpu_assert(cudaMalloc(&block_offsets, GRID_SIZE * sizeof(CurvePoint)));
     gpu_assert(cudaMalloc(&offsets, (uint64_t)GRID_SIZE * BLOCK_SIZE * sizeof(CurvePoint)));
-    thread_offsets_host = new CurvePoint[BLOCK_SIZE];
     gpu_assert(cudaHostAlloc(&thread_offsets_host, BLOCK_SIZE * sizeof(CurvePoint), cudaHostAllocWriteCombined));
 
+    // 生成随机密钥
     _uint256 max_key = _uint256{0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x5D576E73, 0x57A4501D, 0xDFE92F46, 0x681B20A0};
-    max_key = cpu_sub_256(max_key, _uint256{0, 0, 0, 0, 0, 0, 0, GRID_WORK});
+    _uint256 GRID_WORK = cpu_mul_256_mod_p(cpu_mul_256_mod_p(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK}, _uint256{0, 0, 0, 0, 0, 0, 0, BLOCK_SIZE}), _uint256{0, 0, 0, 0, 0, 0, 0, GRID_SIZE});
+    max_key = cpu_sub_256(max_key, GRID_WORK);
     max_key = cpu_sub_256(max_key, _uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK});
     max_key = cpu_add_256(max_key, _uint256{0, 0, 0, 0, 0, 0, 0, 2});
 
@@ -156,7 +174,7 @@ void host_thread(int device, int device_index, int score_method) {
     cudaStream_t streams[2];
     gpu_assert(cudaStreamCreate(&streams[0]));
     gpu_assert(cudaStreamCreate(&streams[1]));
-
+    
     _uint256 previous_random_key = random_key;
     bool first_iteration = true;
     uint64_t start_time;
@@ -165,16 +183,18 @@ void host_thread(int device, int device_index, int score_method) {
 
     while (true) {
         if (!first_iteration) {
-            gpu_address_work<<<GRID_SIZE, BLOCK_SIZE, 0, streams[0]>>>(score_method, offsets);
+            gpu_address_work<<<GRID_SIZE, BLOCK_SIZE, 0, streams[0]>>>(offsets);
         }
 
         if (!first_iteration) {
             previous_random_key = random_key;
             random_key = cpu_add_256(random_key, random_key_increment);
+            if (gte_256(random_key, max_key)) {
+                random_key = cpu_sub_256(random_key, max_key);
+            }
         }
-
         CurvePoint thread_offset = cpu_point_multiply(G, _uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK});
-        p = cpu_point_multiply(G, cpu_add_256(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK - 1}, random_key));
+        CurvePoint p = cpu_point_multiply(G, cpu_add_256(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK - 1}, random_key));
         for (int i = 0; i < BLOCK_SIZE; i++) {
             thread_offsets_host[i] = p;
             p = cpu_point_add(p, thread_offset);
@@ -189,7 +209,7 @@ void host_thread(int device, int device_index, int score_method) {
         }
         start_time = milliseconds();
 
-        gpu_address_init<<<GRID_SIZE / BLOCK_SIZE, BLOCK_SIZE, 0, streams[0]>>>(block_offsets, offsets);
+        gpu_address_init<<<GRID_SIZE/BLOCK_SIZE, BLOCK_SIZE, 0, streams[0]>>>(block_offsets, offsets);
         if (!first_iteration) {
             gpu_assert(cudaMemcpyFromSymbolAsync(device_memory_host, device_memory, (2 + OUTPUT_BUFFER_SIZE * 3) * sizeof(uint64_t), 0, cudaMemcpyDeviceToHost, streams[1]));
             gpu_assert(cudaStreamSynchronize(streams[1]));
@@ -208,6 +228,7 @@ void host_thread(int device, int device_index, int score_method) {
             double speed = GRID_WORK / elapsed / 1000000.0 * 2;
             if (output_counter_host[0] != 0) {
                 int valid_results = 0;
+
                 for (int i = 0; i < output_counter_host[0]; i++) {
                     if (output_buffer2_host[i] < max_score_host[0]) { continue; }
                     valid_results++;
@@ -223,10 +244,6 @@ void host_thread(int device, int device_index, int score_method) {
 
                         uint64_t k_offset = output_buffer_host[i];
                         _uint256 k = cpu_add_256(previous_random_key, cpu_add_256(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK}, _uint256{0, 0, 0, 0, 0, 0, (uint32_t)(k_offset >> 32), (uint32_t)(k_offset & 0xFFFFFFFF)}));
-
-                        if (output_buffer3_host[i]) {
-                            k = cpu_sub_256(N, k);
-                        }
 
                         int idx = valid_results++;
                         results[idx] = k;
@@ -271,20 +288,14 @@ void print_speeds(int num_devices, int* device_ids, double* speeds) {
 }
 
 int main(int argc, char *argv[]) {
-    int score_method = -1; // 0 = leading zeroes, 1 = zeros
-    int num_devices = 0;
-    int device_ids[10];
+    int num_devices = 0;   // 设备数量
+    int device_ids[10];    // 设备ID列表
 
+    // 解析命令行参数
     for (int i = 1; i < argc;) {
         if (strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "-d") == 0) {
             device_ids[num_devices++] = atoi(argv[i + 1]);
             i += 2;
-        } else if (strcmp(argv[i], "--leading-zeros") == 0 || strcmp(argv[i], "-lz") == 0) {
-            score_method = 0;
-            i++;
-        } else if (strcmp(argv[i], "--zeros") == 0 || strcmp(argv[i], "-z") == 0) {
-            score_method = 1;
-            i++;
         } else if (strcmp(argv[i], "--work-scale") == 0 || strcmp(argv[i], "-w") == 0) {
             GRID_SIZE = 1U << atoi(argv[i + 1]);
             i += 2;
@@ -293,16 +304,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // 检查是否指定了设备
     if (num_devices == 0) {
         printf("No devices were specified\n");
         return 1;
     }
 
-    if (score_method == -1) {
-        printf("No scoring method was specified\n");
-        return 1;
-    }
-
+    // 设置设备
     for (int i = 0; i < num_devices; i++) {
         cudaError_t e = cudaSetDevice(device_ids[i]);
         if (e != cudaSuccess) {
@@ -311,14 +319,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // 开启多个线程，每个设备一个线程
     std::vector<std::thread> threads;
     uint64_t global_start_time = milliseconds();
+
     for (int i = 0; i < num_devices; i++) {
-        std::thread th(host_thread, device_ids[i], i, score_method);
+        std::thread th(host_thread, device_ids[i], i, Address{});  // 传入设备ID
         threads.push_back(move(th));
     }
 
     double speeds[100];
+    // 主循环，监听消息队列并打印速度和结果
     while (true) {
         message_queue_mutex.lock();
         if (message_queue.size() == 0) {
@@ -331,7 +342,7 @@ int main(int argc, char *argv[]) {
 
                 int device_index = m.device_index;
 
-                if (m.status == 0) {
+                if (m.status == 0) { // 正常情况
                     speeds[device_index] = m.speed;
 
                     printf("\r");
@@ -339,9 +350,10 @@ int main(int argc, char *argv[]) {
                         Address* addresses = new Address[m.results_count];
                         for (int i = 0; i < m.results_count; i++) {
                             CurvePoint p = cpu_point_multiply(G, m.results[i]);
-                            addresses[i] = cpu_calculate_address(p.x, p.y);
+                            addresses[i] = cpu_calculate_address(p.x, p.y);  // 计算以太坊地址
                         }
 
+                        // 打印结果
                         for (int i = 0; i < m.results_count; i++) {
                             _uint256 k = m.results[i];
                             int score = m.scores[i];
@@ -358,7 +370,8 @@ int main(int argc, char *argv[]) {
                     }
                     print_speeds(num_devices, device_ids, speeds);
                     fflush(stdout);
-                } else if (m.status == 1) {
+                } else {
+                    // 处理错误的情况
                     printf("\rCuda error %d on device %d. Device will halt work.\n", m.error, device_ids[device_index]);
                     print_speeds(num_devices, device_ids, speeds);
                     fflush(stdout);
@@ -367,4 +380,6 @@ int main(int argc, char *argv[]) {
             message_queue_mutex.unlock();
         }
     }
+
+    return 0;
 }
