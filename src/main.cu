@@ -115,6 +115,7 @@ void host_thread(int device, int device_index, Address origin_address) {
     uint64_t* max_score_host;
     uint64_t* output_counter_host;
     uint64_t* output_buffer_host;
+    uint64_t* output_buffer2_host;
 
     gpu_assert(cudaSetDevice(device));
 
@@ -122,6 +123,7 @@ void host_thread(int device, int device_index, Address origin_address) {
     output_counter_host = device_memory_host;
     max_score_host = device_memory_host + 1;
     output_buffer_host = max_score_host + 1;
+    output_buffer2_host = output_buffer_host + OUTPUT_BUFFER_SIZE;
 
     output_counter_host[0] = 0;
     max_score_host[0] = 2;
@@ -135,10 +137,6 @@ void host_thread(int device, int device_index, Address origin_address) {
 
     // 生成随机密钥
     _uint256 max_key = _uint256{0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x5D576E73, 0x57A4501D, 0xDFE92F46, 0x681B20A0};
-    _uint256 GRID_WORK = cpu_mul_256_mod_p(cpu_mul_256_mod_p(_uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK}, _uint256{0, 0, 0, 0, 0, 0, 0, BLOCK_SIZE}), _uint256{0, 0, 0, 0, 0, 0, 0, GRID_SIZE});
-    max_key = cpu_sub_256(max_key, GRID_WORK);
-    max_key = cpu_sub_256(max_key, _uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK});
-    max_key = cpu_add_256(max_key, _uint256{0, 0, 0, 0, 0, 0, 0, 2});
 
     _uint256 base_random_key{0, 0, 0, 0, 0, 0, 0, 0};
     _uint256 random_key_increment = cpu_mul_256_mod_p(cpu_mul_256_mod_p(uint32_to_uint256(BLOCK_SIZE), uint32_to_uint256(GRID_SIZE)), uint32_to_uint256(THREAD_WORK));
@@ -174,7 +172,7 @@ void host_thread(int device, int device_index, Address origin_address) {
     cudaStream_t streams[2];
     gpu_assert(cudaStreamCreate(&streams[0]));
     gpu_assert(cudaStreamCreate(&streams[1]));
-    
+
     _uint256 previous_random_key = random_key;
     bool first_iteration = true;
     uint64_t start_time;
@@ -225,7 +223,7 @@ void host_thread(int device, int device_index, Address origin_address) {
             }
             global_max_score_mutex.unlock();
 
-            double speed = GRID_WORK / elapsed / 1000000.0 * 2;
+            double speed = (double)GRID_WORK / elapsed / 1000000.0 * 2;
             if (output_counter_host[0] != 0) {
                 int valid_results = 0;
 
@@ -274,6 +272,7 @@ void host_thread(int device, int device_index, Address origin_address) {
         first_iteration = false;
     }
 }
+
 
 void print_speeds(int num_devices, int* device_ids, double* speeds) {
     double total = 0.0;
