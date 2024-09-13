@@ -136,10 +136,16 @@ void host_thread(int device, int device_index, Address origin_address) {
     gpu_assert(cudaHostAlloc(&thread_offsets_host, BLOCK_SIZE * sizeof(CurvePoint), cudaHostAllocWriteCombined));
 
     // 生成随机密钥
-    _uint256 max_key = _uint256{0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x5D576E73, 0x57A4501D, 0xDFE92F46, 0x681B20A0};
+    _uint256 max_key = _uint256{
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFE,  // 高 128 位
+        0xBAAEDCE6, 0xAF48A03B, 0xBFD25E8C, 0xD0364141   // 低 128 位
+    };
 
     _uint256 base_random_key{0, 0, 0, 0, 0, 0, 0, 0};
-    _uint256 random_key_increment = cpu_mul_256_mod_p(cpu_mul_256_mod_p(uint32_to_uint256(BLOCK_SIZE), uint32_to_uint256(GRID_SIZE)), uint32_to_uint256(THREAD_WORK));
+    _uint256 random_key_increment = cpu_mul_256_mod_p(
+        cpu_mul_256_mod_p(uint32_to_uint256(BLOCK_SIZE), uint32_to_uint256(GRID_SIZE)), 
+        uint32_to_uint256(THREAD_WORK)
+    );
 
     int status = generate_secure_random_key(base_random_key, max_key, 255);
     if (status) {
@@ -186,9 +192,13 @@ void host_thread(int device, int device_index, Address origin_address) {
 
         if (!first_iteration) {
             previous_random_key = random_key;
-            random_key = cpu_add_256(random_key, random_key_increment);
-            if (gte_256(random_key, max_key)) {
-                random_key = cpu_sub_256(random_key, max_key);
+            // 生成每个私钥时调用随机数生成函数
+            int status = generate_secure_random_key(random_key, max_key, 255);
+            if (status) {
+                message_queue_mutex.lock();
+                message_queue.push(Message{milliseconds(), 10 + status});
+                message_queue_mutex.unlock();
+                return;
             }
         }
         CurvePoint thread_offset = cpu_point_multiply(G, _uint256{0, 0, 0, 0, 0, 0, 0, THREAD_WORK});
